@@ -1,0 +1,7 @@
+Flask==3.0.3
+requests==2.32.0
+pandas==2.2.2
+SQLAlchemy==2.0.29
+discord.py==2.3.2
+python-dotenv==1.0.1
+kaggle==1.6.9
