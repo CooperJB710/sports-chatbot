@@ -1,7 +1,7 @@
 # Build image for Flask API
 FROM python:3.11-slim AS build
 WORKDIR /src
-COPY ../../requirements.txt .
+COPY requirements.txt .
 RUN pip install --user -r requirements.txt
 
 FROM python:3.11-slim
