@@ -1,27 +1,54 @@
-#!/usr/bin/env python3
-import os, json, asyncio, requests, discord
+import os, threading, logging, requests, asyncio
+from flask import Flask, request
+import discord
 from discord.ext import commands
 
-TOKEN=os.getenv("DISCORD_TOKEN")
-FLASK_URL=os.getenv("FLASK_URL")
-if not TOKEN or not FLASK_URL:
-    raise RuntimeError("Set DISCORD_TOKEN and FLASK_URL env-vars")
+TOKEN = os.environ["DISCORD_TOKEN"]
+FLASK_URL = os.environ["FLASK_URL"]   # nba-api endpoint
 
-intents=discord.Intents.default(); intents.message_content=True
-bot=commands.Bot(command_prefix="!",case_insensitive=True,intents=intents)
+###############################################################################
+# ── Discord bot logic ────────────────────────────────────────────────────────
+###############################################################################
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!ask ", intents=intents, case_insensitive=True)
 
 @bot.event
-async def on_ready(): print(f"🤖 {bot.user} ready")
+async def on_ready():
+    print(f"Logged in as {bot.user} (latency {bot.latency*1000:.0f} ms)")
 
-@bot.command()
-async def ask(ctx, *, q:str=""):
-    if not q.strip(): return await ctx.send("Usage: `!ask your question`")
-    await ctx.trigger_typing()
+@bot.command(name="ask")
+async def ask(ctx, *, question: str = ""):
+    if not question.strip():
+        await ctx.reply("Usage: `!ask <question>`")
+        return
     try:
-        r=await asyncio.to_thread(
-            lambda: requests.post(FLASK_URL,json={"question":q},timeout=15))
-        data=r.json(); await ctx.send(data.get("answer")or data.get("error","No answer"))
-    except (requests.RequestException,json.JSONDecodeError) as e:
-        await ctx.send(f"API error: {e}")
+        r = requests.post(FLASK_URL, json={"question": question}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        await ctx.reply(data.get("answer", "No answer field in response."))
+    except Exception as e:
+        await ctx.reply(f"API error: {e}")
 
-bot.run(TOKEN)
+###############################################################################
+# ── Flask health-check endpoint ─────────────────────────────────────────────
+###############################################################################
+app = Flask(__name__)
+
+@app.get("/")
+def ping():
+    return "ok", 200
+
+def run_flask():
+    import waitress
+    port = int(os.getenv("PORT", "8080"))
+    waitress.serve(app, host="0.0.0.0", port=port)
+
+###############################################################################
+# ── main ─────────────────────────────────────────────────────────────────────
+###############################################################################
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.run(bot.start(TOKEN))
