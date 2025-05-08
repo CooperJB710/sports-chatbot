@@ -1,54 +1,30 @@
-import os, threading, logging, requests, asyncio
-from flask import Flask, request
+# services/bot/discord_bot.py
+import os, threading
+from flask import Flask
 import discord
 from discord.ext import commands
 
-TOKEN = os.environ["DISCORD_TOKEN"]
-FLASK_URL = os.environ["FLASK_URL"]   # nba-api endpoint
+# 1) tiny HTTP server just for Cloud Run
+site = Flask(__name__)
 
-###############################################################################
-# ── Discord bot logic ────────────────────────────────────────────────────────
-###############################################################################
-intents = discord.Intents.default()
-intents.message_content = True
+@site.route("/", methods=["GET", "HEAD"])
+def health():
+    return "bot alive", 200
 
-bot = commands.Bot(command_prefix="!ask ", intents=intents, case_insensitive=True)
+# 2) start Discord bot in a background thread
+def start_bot() -> None:
+    intents = discord.Intents.default()
+    intents.message_content = True
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (latency {bot.latency*1000:.0f} ms)")
+    bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
 
-@bot.command(name="ask")
-async def ask(ctx, *, question: str = ""):
-    if not question.strip():
-        await ctx.reply("Usage: `!ask <question>`")
-        return
-    try:
-        r = requests.post(FLASK_URL, json={"question": question}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        await ctx.reply(data.get("answer", "No answer field in response."))
-    except Exception as e:
-        await ctx.reply(f"API error: {e}")
+    @bot.event
+    async def on_ready():
+        print(f"🤖  logged in as {bot.user} — ready to serve!")
 
-###############################################################################
-# ── Flask health-check endpoint ─────────────────────────────────────────────
-###############################################################################
-app = Flask(__name__)
+    TOKEN = os.environ["DISCORD_TOKEN"]
+    bot.run(TOKEN)
 
-@app.get("/")
-def ping():
-    return "ok", 200
-
-def run_flask():
-    import waitress
-    port = int(os.getenv("PORT", "8080"))
-    waitress.serve(app, host="0.0.0.0", port=port)
-
-###############################################################################
-# ── main ─────────────────────────────────────────────────────────────────────
-###############################################################################
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(bot.start(TOKEN))
+    threading.Thread(target=start_bot, daemon=True).start()
+    site.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
