@@ -165,62 +165,48 @@ def chat():
 # --------------------------------------------------------------------------- #
 #  Very small landing page so people can test in a browser
 # --------------------------------------------------------------------------- #
-@app.get("/")
-def home():
+@app.get("/ui")  # moved to /ui so / stays a pure health-check
+def ui():
     return """
 <!DOCTYPE html>
-<html>
-<head>
-  <title>NBA Stats Bot</title>
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 800px; margin:0 auto; padding:20px; }
-    #question { padding:8px; width:300px; }
-    button { padding:8px 16px; background:#0066cc; color:#fff; border:none; cursor:pointer; }
-    button:hover { background:#0052a3; }
-    #response { margin-top:20px; padding:15px; border:1px solid #ddd; border-radius:4px; min-height:50px; }
-    .examples { margin-top:30px; color:#666; }
-  </style>
-</head>
-<body>
-  <h1>Welcome to the NBA Stats Bot</h1>
-  <p>Ask about team statistics or recent games</p>
-
-  <input id="question" placeholder="e.g. 'Last game for the Lakers'" size="40"/>
-  <button onclick="ask()">Ask</button>
-
-  <div id="response"></div>
-
-  <div class="examples">
-    <p>Try these examples:</p>
-    <ul>
-      <li>What did the Warriors average in 2022?</li>
-      <li>Last game for the Celtics</li>
-      <li>Recent result for Miami Heat</li>
-    </ul>
-  </div>
-
-  <script>
-    async function ask() {
-      const q = document.getElementById("question").value.trim();
-      if (!q) return;
-      const div = document.getElementById("response");
-      div.textContent = "Thinking…";
-      try {
-        const res  = await fetch("/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question: q })
-        });
-        const data = await res.json();
-        div.textContent = data.answer || ("Error: " + (data.error||"Unknown"));
-        if (!data.answer) div.style.color = "red";
-      } catch { div.textContent = "Network error"; div.style.color = "red"; }
-    }
-    document.getElementById("question").addEventListener("keypress",
-      e => e.key === "Enter" && ask());
-  </script>
-</body>
-</html>
+<html><head><title>NBA Stats Bot</title>
+<meta charset="utf-8">
+<style>
+ body{font-family:Arial,Helvetica,sans-serif;max-width:750px;margin:0 auto;padding:20px}
+ #question{padding:8px;width:320px}button{padding:8px 16px;background:#0066cc;color:#fff;border:0;cursor:pointer}
+ button:hover{background:#0052a3}#response{margin-top:20px;padding:15px;border:1px solid #ddd;border-radius:4px;min-height:50px}
+ .examples{margin-top:30px;color:#666}
+</style></head><body>
+<h1>NBA Stats Bot</h1>
+<p>Ask about team statistics or recent games.</p>
+<input id="question" placeholder="e.g. 'Last game for the Lakers'" size="40">
+<button onclick="ask()">Ask</button>
+<div id="response"></div>
+<div class="examples">
+ <p>Try:</p>
+ <ul>
+  <li>What did the Warriors average in 2022?</li>
+  <li>Last game for the Celtics</li>
+  <li>Recent result for Miami Heat</li>
+ </ul>
+</div>
+<script>
+ async function ask(){
+   const q=document.getElementById("question").value.trim();
+   if(!q) return;
+   const div=document.getElementById("response");
+   div.textContent="Thinking…";div.style.color="";
+   try{
+     const res=await fetch("/chat",{method:"POST",headers:{'Content-Type':'application/json'},
+       body:JSON.stringify({question:q})});
+     const data=await res.json();
+     div.textContent=data.answer||data.error||"Unexpected response";
+     if(data.error) div.style.color="red";
+   }catch(e){div.textContent="Network error";div.style.color="red";}
+ }
+ document.getElementById("question")
+   .addEventListener("keypress",e=>e.key==="Enter"&&ask());
+</script></body></html>
 """
 
 
