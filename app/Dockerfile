@@ -9,7 +9,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and data
-COPY . .
+COPY ../services/etl .
 
 # Run ETL during build to generate the SQLite database
 RUN python run_etl.py 2024
