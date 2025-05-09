@@ -1,218 +1,223 @@
-#!/usr/bin/env python3
-"""
-Flask NBA Stats Bot
-------------------
-
- • GET  / and /healthz – lightweight 200-OK probes so Cloud Run (or any LB)
-   can verify the container is alive.
- • POST /chat        – JSON  {"question": "..."}  →  {"answer": "..."}
-
-The service reads a local SQLite DB ( nba_stats.db ) that the ETL step writes.
-"""
-
-from __future__ import annotations
-import os, re, sqlite3, json, pathlib
+import os, re, sqlite3, requests, logging, json
 from flask import Flask, request, jsonify
+import dotenv
 
-# --------------------------------------------------------------------------- #
-#  Paths & Flask setup
-# --------------------------------------------------------------------------- #
-APP_DIR = pathlib.Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "nba_stats.db"                 # →  services/api/nba_stats.db
-app     = Flask(__name__)
+dotenv.load_dotenv()
+API_KEY = os.getenv("TSD_KEY", "3")  # TheSportsDB API key (default "3" for demo)
+DB_PATH = os.path.join(os.path.dirname(__file__), "nba_stats.db")
+BASE_URL = f"https://www.thesportsdb.com/api/v1/json/{API_KEY}"
 
-# --------------------------------------------------------------------------- #
-#  Team “fuzzy” aliases  (feel free to extend)
-# --------------------------------------------------------------------------- #
-ALIASES: dict[str, str] = {
-    "wiz": "washington wizards", "wantnos": "washington wizards",
-    "lakers": "los angeles lakers",
-    "celtics": "boston celtics", "celllics": "boston celtics",
-    "warriors": "golden state warriors",
-    "heat": "miami heat",
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)  # Configure logging for debugging
+
+# Team name normalization for common aliases/typos
+TEAM_ALIASES = {
+    'wantnos': 'washington wizards',
+    'wiz': 'washington wizards',
+    'lakers': 'los angeles lakers',
+    'celtics': 'boston celtics',
+    'celllics': 'boston celtics',  # handle common misspelling
+    'warriors': 'golden state warriors',
+    'heat': 'miami heat',
+    # ... add more aliases as needed ...
 }
 
-# --------------------------------------------------------------------------- #
-#  Build {search_key → team_id} once at start-up
-# --------------------------------------------------------------------------- #
-def _build_team_map() -> dict[str, int]:
-    try:
-        with sqlite3.connect(DB_PATH) as c:
-            rows = c.execute(
-                "SELECT team_id, team_name, abbrev, city FROM teams"
-            ).fetchall()
-    except sqlite3.OperationalError:
-        # ETL hasn’t run yet – keep serving health endpoints anyway
-        app.logger.warning("⚠️  nba_stats.db missing – /chat will 500 until ETL runs")
-        return {}
+def normalize_team_name(team_name: str) -> str:
+    """Normalize team names and handle common aliases/typos."""
+    return TEAM_ALIASES.get(team_name.lower().strip(), team_name.lower().strip())
 
-    mapping: dict[str, int] = {}
-    for tid, name, abbr, city in rows:
-        tokens = {
-            name.lower(),
-            abbr.lower(),
-            city.lower(),
-            f"{city.lower()} {name.split()[-1].lower()}",
-        }
-        for t in tokens:
-            mapping[t] = tid
-    return mapping
-
-
-TEAM_ID = _build_team_map()
-
-
-def _resolve_team(raw: str) -> int | None:
-    """Return team_id for a fuzzy team string or None if unknown."""
-    key = ALIASES.get(raw.lower().strip(), raw.lower().strip())
-    return TEAM_ID.get(key)
-
-
-# --------------------------------------------------------------------------- #
-#  Small helper queries
-# --------------------------------------------------------------------------- #
-def _avg_pts(tid: int, season: int) -> float | None:
-    sql = """
-    WITH pts AS (
-        SELECT home_score AS p FROM games WHERE season=? AND home_id=?
-        UNION ALL
-        SELECT away_score      FROM games WHERE season=? AND away_id=?
+def query_local(team: str, season: int):
+    """Query the local SQLite database for a team's stats in a given season."""
+    query = (
+        "SELECT pts, fgm, fga, \"fg%\", ast, trb "
+        "FROM team_stats "
+        "WHERE team LIKE ? AND season = ?"
     )
-    SELECT ROUND(AVG(p), 1) FROM pts;
-    """
-    with sqlite3.connect(DB_PATH) as c:
-        return c.execute(sql, (season, tid, season, tid)).fetchone()[0]
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(query, (f"%{team}%", season)).fetchone()
+    except sqlite3.Error as e:
+        logging.error(f"Database error querying local stats: {e}")
+        return None
+    if row:
+        # Map query result to dict with readable keys
+        return dict(zip(["PTS", "FGM", "FGA", "FG%", "AST", "REB"], row))
+    return None
 
+def query_tsdb(endpoint: str, **params):
+    """Query TheSportsDB API for the given endpoint and parameters."""
+    url = f"{BASE_URL}/{endpoint}.php"
+    logging.info(f"Calling external API: {url} params={params}")
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
-def _last_game(tid: int):
-    sql = """
-      SELECT date, home_id, away_id, home_score, away_score
-      FROM games
-      WHERE home_id = ? OR away_id = ?
-      ORDER BY date DESC LIMIT 1;
-    """
-    with sqlite3.connect(DB_PATH) as c:
-        return c.execute(sql, (tid, tid)).fetchone()
+def extract_team_name(question: str, trigger_phrase: str) -> str:
+    """Extract and normalize team name from the question text following a trigger phrase."""
+    # Take the part of the question after the trigger phrase
+    part = question.split(trigger_phrase, 1)[-1]
+    # Keep only alphabetic words (strip punctuation/numbers)
+    team_name = " ".join(word for word in part.split() if word.isalpha()).strip()
+    return normalize_team_name(team_name)
 
-
-def _team_name(tid: int) -> str:
-    with sqlite3.connect(DB_PATH) as c:
-        return c.execute("SELECT team_name FROM teams WHERE team_id=?", (tid,)).fetchone()[0]
-
-
-# --------------------------------------------------------------------------- #
-#  Health-check routes
-# --------------------------------------------------------------------------- #
-@app.get("/")
-def root():
-    """Used by Cloud Run default probe (and quick curl tests)."""
-    return "OK", 200
-
-
-@app.get("/healthz")
-def healthz():
-    """Separate health endpoint (if you later customise / probes)."""
-    return "healthy", 200
-
-
-# --------------------------------------------------------------------------- #
-#  /chat  –  main JSON API
-# --------------------------------------------------------------------------- #
 @app.post("/chat")
 def chat():
-    data = request.get_json(silent=True) or {}
-    question = (data.get("question") or "").lower()
+    # Parse the JSON request
+    data = request.get_json(silent=True)
+    if not data or 'question' not in data:
+        return jsonify(error="Invalid request format: JSON with 'question' field required."), 400
 
+    question = data.get("question", "").lower()
+    logging.info(f"Received question: {question}")
     try:
-        # -------- average PPG -----------------------------------------------
+        # 1. Handle queries about average points (PPG) for a team in a season
         if "average" in question and ("points" in question or "ppg" in question):
-            # year – default to most recent if not supplied
-            m     = re.search(r"\b(20\d{2})\b", question)
-            year  = int(m.group()) if m else sqlite3.connect(DB_PATH) \
-                                               .execute("SELECT MAX(season) FROM games").fetchone()[0]
-            team_part = re.sub(r"\b(average|points|ppg|\d{4})\b", "", question).strip()
-            tid  = _resolve_team(team_part)
-            if not tid:
-                return jsonify(answer="Team not recognised."), 200
-            avg  = _avg_pts(tid, year)
-            return jsonify(answer=f"{_team_name(tid)} averaged {avg} PPG in {year}.")
-        # -------- last game --------------------------------------------------
-        if any(p in question for p in ("last game", "recent result", "last match")):
-            trig = next(p for p in ("last game", "recent result", "last match") if p in question)
-            tid  = _resolve_team(question.split(trig)[-1])
-            if not tid:
-                return jsonify(answer="Team not recognised."), 200
-            row = _last_game(tid)
-            if not row:
-                return jsonify(answer="No recent games found."), 200
-            date, home, away, hs, as_ = row
-            return jsonify(answer=f"🏀 {date}: {_team_name(home)} {hs} – {as_} {_team_name(away)}")
-        # -------- fallback ----------------------------------------------------
-        return jsonify(
-            answer=(
-                "Try e.g. 'What did the Lakers average in 2024?' or "
-                "'Last game for the Warriors'"
+            # Find a 4-digit year in the question (default to 2023 if not found)
+            match = re.search(r"(\d{4})", question)
+            season = int(match.group(1)) if match else 2023
+            team = extract_team_name(question, "average" if "average" in question else "ppg")
+
+            if len(team) < 3:  # too short to be a valid team name
+                return jsonify(answer="Please provide a full team name."), 200
+
+            stats = query_local(team, season)
+            if stats:
+                answer_text = (
+                    f"In {season}, {team.title()} averaged:\n"
+                    f"• Points: {stats['PTS']} PPG\n"
+                    f"• Field Goal %: {stats['FG%']}\n"
+                    f"• Assists: {stats['AST']}\n"
+                    f"• Rebounds: {stats['REB']}"
+                )
+                return jsonify(answer=answer_text), 200
+            else:
+                return jsonify(answer=f"Sorry, no stats available for {team.title()} in {season}."), 200
+
+        # 2. Handle queries about the last game/result for a team
+        if any(phrase in question for phrase in ["last game", "recent result", "last match"]):
+            # Determine which trigger phrase was used
+            if "last game" in question:
+                trigger = "last game"
+            elif "recent result" in question:
+                trigger = "recent result"
+            else:
+                trigger = "last match"
+            team_name = extract_team_name(question, trigger)
+
+            if len(team_name) < 3:
+                return jsonify(answer="Please provide a full team name."), 200
+
+            # Search team by name via TheSportsDB API
+            search_data = query_tsdb("searchteams", t=team_name)
+            teams_list = search_data.get("teams")
+            if not teams_list:
+                return jsonify(answer=f"Team '{team_name.title()}' not found. Try using an official team name or city."), 200
+
+            # Find the specific NBA team in search results (TheSportsDB may return multiple sports)
+            nba_team = next((team for team in teams_list if team.get("strLeague") == "NBA"), None)
+            if not nba_team:
+                return jsonify(answer=f"'{team_name.title()}' does not appear to be an NBA team."), 200
+
+            # Get the last event (game) for that team
+            team_id = nba_team["idTeam"]
+            events_data = query_tsdb("eventslast", id=team_id)
+            if not events_data.get("results"):
+                return jsonify(answer=f"No recent games found for {nba_team['strTeam']}."), 200
+
+            last_game = events_data["results"][0]
+            home_team = last_game.get('strHomeTeam', 'Unknown')
+            away_team = last_game.get('strAwayTeam', 'Unknown')
+            home_score = last_game.get('intHomeScore', '?')
+            away_score = last_game.get('intAwayScore', '?')
+            date = last_game.get('dateEvent', 'unknown date')
+            answer_text = (
+                f"🏀 {nba_team['strTeam']}'s Last Game:\n"
+                f"• Matchup: {home_team} vs {away_team}\n"
+                f"• Score: {home_score}-{away_score}\n"
+                f"• Date: {date}"
             )
-        )
-    except json.JSONDecodeError:
-        return jsonify(error="Bad JSON"), 400
-    except Exception as exc:
-        # log for Cloud Run -> Cloud Logging
-        app.logger.exception("Unhandled error in /chat")
-        return jsonify(error=f"Server error: {exc}"), 500
+            return jsonify(answer=answer_text), 200
 
+        # 3. Fallback response for any other queries
+        return jsonify(answer=(
+            "I can help with:\n"
+            "• Team averages: 'What did the Lakers average in 2020?'\n"
+            "• Recent games: 'Last game for the Warriors'\n\n"
+            "Please try one of these questions."
+        )), 200
 
-# --------------------------------------------------------------------------- #
-#  Very small landing page so people can test in a browser
-# --------------------------------------------------------------------------- #
-@app.get("/ui")  # moved to /ui so / stays a pure health-check
-def ui():
+    except requests.RequestException as e:
+        logging.error(f"External API request failed: {e}")
+        return jsonify(error="Failed to retrieve data from external API."), 502
+    except Exception as e:
+        logging.exception(f"Unexpected error: {e}")
+        return jsonify(error=f"Unexpected server error: {e}"), 500
+
+@app.get("/")
+def home():
+    # Simple HTML page to interact with the chatbot
     return """
-<!DOCTYPE html>
-<html><head><title>NBA Stats Bot</title>
-<meta charset="utf-8">
-<style>
- body{font-family:Arial,Helvetica,sans-serif;max-width:750px;margin:0 auto;padding:20px}
- #question{padding:8px;width:320px}button{padding:8px 16px;background:#0066cc;color:#fff;border:0;cursor:pointer}
- button:hover{background:#0052a3}#response{margin-top:20px;padding:15px;border:1px solid #ddd;border-radius:4px;min-height:50px}
- .examples{margin-top:30px;color:#666}
-</style></head><body>
-<h1>NBA Stats Bot</h1>
-<p>Ask about team statistics or recent games.</p>
-<input id="question" placeholder="e.g. 'Last game for the Lakers'" size="40">
-<button onclick="ask()">Ask</button>
-<div id="response"></div>
-<div class="examples">
- <p>Try:</p>
- <ul>
-  <li>What did the Warriors average in 2022?</li>
-  <li>Last game for the Celtics</li>
-  <li>Recent result for Miami Heat</li>
- </ul>
-</div>
-<script>
- async function ask(){
-   const q=document.getElementById("question").value.trim();
-   if(!q) return;
-   const div=document.getElementById("response");
-   div.textContent="Thinking…";div.style.color="";
-   try{
-     const res=await fetch("/chat",{method:"POST",headers:{'Content-Type':'application/json'},
-       body:JSON.stringify({question:q})});
-     const data=await res.json();
-     div.textContent=data.answer||data.error||"Unexpected response";
-     if(data.error) div.style.color="red";
-   }catch(e){div.textContent="Network error";div.style.color="red";}
- }
- document.getElementById("question")
-   .addEventListener("keypress",e=>e.key==="Enter"&&ask());
-</script></body></html>
-"""
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>NBA Stats Bot</title>
+        <style>
+          body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+          #question { padding: 8px; width: 300px; }
+          button { padding: 8px 16px; background: #0066cc; color: white; border: none; cursor: pointer; }
+          button:hover { background: #0052a3; }
+          #response { margin-top: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 4px; min-height: 50px; }
+          .examples { margin-top: 30px; color: #666; }
+        </style>
+      </head>
+      <body>
+        <h1>Welcome to the NBA Stats Bot</h1>
+        <p>Ask about team statistics or recent games:</p>
+        <input id="question" placeholder="e.g. 'Last game for the Lakers'" size="40"/>
+        <button onclick="ask()">Ask</button>
+        <div id="response"></div>
+        <div class="examples">
+          <p>Try these examples:</p>
+          <ul>
+            <li>What did the Warriors average in 2022?</li>
+            <li>Last game for the Celtics</li>
+            <li>Recent result for Miami Heat</li>
+          </ul>
+        </div>
+        <script>
+          async function ask() {
+            const q = document.getElementById("question").value;
+            if (!q.trim()) return;
+            const responseDiv = document.getElementById("response");
+            responseDiv.textContent = "Thinking...";
+            responseDiv.style.color = "inherit";
+            try {
+              const res = await fetch("/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question: q })
+              });
+              const data = await res.json();
+              if (data.answer) {
+                responseDiv.textContent = data.answer;
+              } else {
+                responseDiv.textContent = "Error: " + (data.error || "Unknown error");
+                responseDiv.style.color = "red";
+              }
+            } catch (err) {
+              responseDiv.textContent = "Network error - please try again";
+              responseDiv.style.color = "red";
+            }
+          }
+          // Allow pressing Enter to submit the question
+          document.getElementById("question").addEventListener("keypress", function(e) {
+            if (e.key === "Enter") ask();
+          });
+        </script>
+      </body>
+    </html>
+    """
 
-
-# --------------------------------------------------------------------------- #
-#  Local development helper
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":  # Enables `python app.py` for quick local test
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+if __name__ == "__main__":
+    # Run the Flask development server for local testing
+    app.run(host="0.0.0.0", port=8080)
