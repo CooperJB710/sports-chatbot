@@ -1,29 +1,16 @@
-# ────────────────────────────────────────────────────────────────
-#  Build stage – install Python deps in a throw-away layer
-# ────────────────────────────────────────────────────────────────
-FROM python:3.11-slim AS build
-WORKDIR /src
-
-COPY requirements.txt .
-RUN pip install --user -r requirements.txt
-
-# Copy the real Flask application package from the repo root.
-# The build-context is “services/api”, so two “..” go back to the repo root.
-COPY ../../app /src/app
-
-# ────────────────────────────────────────────────────────────────
-#  Runtime stage – just the app + wheels, nothing else
-# ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  services/api/Dockerfile   (simple, single-stage build)
+# ─────────────────────────────────────────────────────────────
 FROM python:3.11-slim
+
+# ── install Python packages ──────────────────────────────────
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# wheel cache from the first stage
-COPY --from=build /root/.local /root/.local
-# Flask code
-COPY --from=build /src/app /app/app
+# ── copy Flask application code ──────────────────────────────
+COPY app.py .
 
-ENV PATH="/root/.local/bin:${PATH}"
+# ── launch Gunicorn on Cloud Run’s default port (8080) ───────
 ENV PYTHONUNBUFFERED=1
-
-# Gunicorn entry-point
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "app.app:app"]
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "app:app"]
